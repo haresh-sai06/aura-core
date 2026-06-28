@@ -1,0 +1,5 @@
+# Camera/CV layer (interface #1). Install only on machines that run the webcam monitor.
+# mediapipe is pinned: 0.10.14 still ships the `solutions.face_mesh` API used by
+# camera_monitor.py. Newer builds (0.10.35) dropped it for the Tasks API.
+opencv-python>=4.9
+mediapipe==0.10.14
