@@ -63,6 +63,8 @@ def main() -> None:
     ap.add_argument("--report-interval", type=float, default=0.4, help="seconds between drowsy reports while closed")
     ap.add_argument("--reopen-debounce", type=float, default=0.25,
                     help="eyes must read open continuously this long before the closure timer resets")
+    ap.add_argument("--state-interval", type=float, default=0.2,
+                    help="seconds between live driver.state updates sent for the Live Monitor")
     ap.add_argument("--show", action="store_true", help="show the webcam window with EAR overlay")
     ap.add_argument("--debug", action="store_true", help="print EAR readings ~2x/sec for tuning")
     args = ap.parse_args()
@@ -82,6 +84,7 @@ def main() -> None:
     eyes_open_since = None
     ear_smooth = None
     last_report = 0.0
+    last_state = 0.0
     alerted = False
     last_debug = 0.0
 
@@ -144,6 +147,12 @@ def main() -> None:
                             alerted = False
                         eyes_closed_since = None
 
+                # Throttled live state for the Live Monitor dashboard.
+                if now - last_state >= args.state_interval:
+                    last_state = now
+                    closure = (now - eyes_closed_since) if eyes_closed_since is not None else 0.0
+                    post(f"/emit/state?ear={ear:.3f}&eye_closure_s={closure:.2f}&face_present=true")
+
                 if args.show:
                     color = (0, 0, 255) if closed else (0, 255, 0)
                     cv2.putText(frame, f"EAR {ear:.2f}", (12, 34),
@@ -156,6 +165,9 @@ def main() -> None:
                 eyes_closed_since = None
                 eyes_open_since = None
                 ear_smooth = None
+                if now - last_state >= args.state_interval:
+                    last_state = now
+                    post("/emit/state?ear=0&eye_closure_s=0&face_present=false")
 
             if args.show:
                 cv2.imshow("Aura camera", frame)

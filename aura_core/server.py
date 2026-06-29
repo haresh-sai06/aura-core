@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, Set
+from typing import Any, Dict, Optional, Set
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 
 from .messages import MessageType, envelope
 from .persona import PersonaStore
@@ -21,6 +22,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [aura-core] %(messag
 log = logging.getLogger("aura-core")
 
 app = FastAPI(title="Aura Core", version="0.1.0")
+
+# Allow the dashboard (served from localhost:5173) to POST signals from the in-browser camera.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 clients: Set[WebSocket] = set()
 personas = PersonaStore()
@@ -34,8 +43,9 @@ current_driver = "haresh"
 _alerted = False
 
 
-async def broadcast(message: Dict[str, Any]) -> None:
-    """Send one envelope to every connected client; drop any that have gone away."""
+async def broadcast(message: Dict[str, Any], quiet: bool = False) -> None:
+    """Send one envelope to every connected client; drop any that have gone away.
+    quiet=True suppresses the log line (used for high-frequency driver.state updates)."""
     text = json.dumps(message)
     dead = []
     for ws in clients:
@@ -45,7 +55,8 @@ async def broadcast(message: Dict[str, Any]) -> None:
             dead.append(ws)
     for ws in dead:
         clients.discard(ws)
-    log.info("broadcast %s -> %d client(s)", message.get("type"), len(clients))
+    if not quiet:
+        log.info("broadcast %s -> %d client(s)", message.get("type"), len(clients))
 
 
 @app.websocket("/")
@@ -81,13 +92,18 @@ async def emit_identify() -> Dict[str, Any]:
 
 
 @app.post("/emit/drowsy")
-async def emit_drowsy(eye_closure_s: float = 3.2) -> Dict[str, Any]:
-    """A drowsiness signal (faked by the test CLI, or real from the camera monitor).
-    The policy decides if it warrants an alert for THIS driver; dedupe avoids re-broadcasting."""
+async def emit_drowsy(eye_closure_s: float = 3.2, score: Optional[float] = None) -> Dict[str, Any]:
+    """A drowsiness signal. Prefer the fused `score` (browser 7-signal pipeline); fall back to
+    `eye_closure_s` (Python camera). The policy applies THIS driver's personal threshold; dedupe
+    avoids re-broadcasting while an alert is active."""
     global _alerted
-    decision = policy.evaluate(current_driver, eye_closure_s)
+    decision = policy.evaluate(
+        current_driver,
+        eye_closure_s=(None if score is not None else eye_closure_s),
+        score=score,
+    )
     if decision is None:
-        return {"sent": None, "note": "below this driver's baseline — no alert (a generic DMS might false-alarm)"}
+        return {"sent": None, "note": "below this driver's personal threshold — no alert"}
     if _alerted:
         return {"sent": None, "note": "alert already active (deduped)"}
     _alerted = True
@@ -103,3 +119,35 @@ async def emit_resume() -> Dict[str, Any]:
     msg = envelope("safety.clear", {"driver": personas.get(current_driver).display_name})
     await broadcast(msg)
     return {"sent": msg}
+
+
+@app.post("/emit/state")
+async def emit_state(request: Request) -> Dict[str, Any]:
+    """Continuous live driver signal for the Live Monitor (throttled). Accepts a rich JSON body
+    (the browser's full 7-signal pipeline) or simple query params (the Python camera). Broadcast
+    as driver.state; never gates an alert (that's /emit/drowsy)."""
+    p = personas.get(current_driver)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+
+    if isinstance(body, dict) and body:
+        payload = dict(body)
+        payload.setdefault("driver", p.display_name)
+        payload.setdefault("baseline", p.eye_closure_threshold_s)
+        payload.setdefault("threshold", p.drowsiness_threshold)
+    else:
+        qp = request.query_params
+        face = qp.get("face_present", "true") == "true"
+        closure = float(qp.get("eye_closure_s", 0) or 0)
+        ear = float(qp.get("ear", 0.3) or 0.3)
+        score = 0.0 if not face else max(0.0, min(100.0, (closure / max(p.eye_closure_threshold_s, 0.1)) * 80.0))
+        payload = {
+            "facePresent": face, "ear": round(ear, 3), "eyeClosureS": round(closure, 2),
+            "score": round(score, 1), "baseline": p.eye_closure_threshold_s,
+            "threshold": p.drowsiness_threshold, "driver": p.display_name,
+        }
+
+    await broadcast(envelope(MessageType.DRIVER_STATE, payload), quiet=True)
+    return {"ok": True}

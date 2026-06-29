@@ -14,6 +14,7 @@ from typing import Any, Dict
 class MessageType(str, Enum):
     # Core -> clients
     DRIVER_IDENTIFIED = "driver.identified"   # face recognized -> welcome + persona
+    DRIVER_STATE = "driver.state"             # continuous live signal: ear, closure, score
     SAFETY_ALERT = "safety.alert"             # adaptive drowsiness/distraction warning
     EXPLAIN = "explain"                        # "why did Aura warn you?" detail
     # Clients -> Core
