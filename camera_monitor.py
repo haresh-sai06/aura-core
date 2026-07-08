@@ -63,6 +63,8 @@ def main() -> None:
     ap.add_argument("--report-interval", type=float, default=0.4, help="seconds between drowsy reports while closed")
     ap.add_argument("--reopen-debounce", type=float, default=0.25,
                     help="eyes must read open continuously this long before the closure timer resets")
+    ap.add_argument("--face-lost-grace", type=float, default=1.5,
+                    help="ignore face-tracking dropouts shorter than this (seconds) so identify doesn't re-fire on blips")
     ap.add_argument("--state-interval", type=float, default=0.2,
                     help="seconds between live driver.state updates sent for the Live Monitor")
     ap.add_argument("--show", action="store_true", help="show the webcam window with EAR overlay")
@@ -80,6 +82,7 @@ def main() -> None:
         raise SystemExit(f"Could not open camera {args.camera}")
 
     face_present = False
+    face_gone_since = None
     eyes_closed_since = None
     eyes_open_since = None
     ear_smooth = None
@@ -107,6 +110,7 @@ def main() -> None:
             now = time.time()
 
             if result.multi_face_landmarks:
+                face_gone_since = None  # face is present this frame — cancel any pending "gone" timer
                 if not face_present:
                     face_present = True
                     print("[camera] face detected -> identify")
@@ -158,16 +162,20 @@ def main() -> None:
                     cv2.putText(frame, f"EAR {ear:.2f}", (12, 34),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
             else:
-                if alerted:
-                    post("/emit/resume")
-                    alerted = False
-                face_present = False
-                eyes_closed_since = None
-                eyes_open_since = None
-                ear_smooth = None
-                if now - last_state >= args.state_interval:
-                    last_state = now
-                    post("/emit/state?ear=0&eye_closure_s=0&face_present=false")
+                # Debounce brief tracking dropouts — a 1-frame miss shouldn't re-fire identify.
+                if face_gone_since is None:
+                    face_gone_since = now
+                if now - face_gone_since >= args.face_lost_grace:
+                    if alerted:
+                        post("/emit/resume")
+                        alerted = False
+                    face_present = False
+                    eyes_closed_since = None
+                    eyes_open_since = None
+                    ear_smooth = None
+                    if now - last_state >= args.state_interval:
+                        last_state = now
+                        post("/emit/state?ear=0&eye_closure_s=0&face_present=false")
 
             if args.show:
                 cv2.imshow("Aura camera", frame)

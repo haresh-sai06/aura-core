@@ -4,3 +4,6 @@ __pycache__/
 .env
 *.sqlite
 .DS_Store
+
+# Runtime persona state (learned baselines) — seeded from code, not source
+aura_core/personas.json
