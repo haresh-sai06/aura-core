@@ -21,6 +21,7 @@ import argparse
 import base64
 import json
 import math
+import os
 import threading
 import time
 import urllib.request
@@ -106,9 +107,16 @@ def main() -> None:
     ap.add_argument("--vision-interval", type=float, default=12.0, help="seconds between vision-LLM scene reads")
     ap.add_argument("--no-face-id", action="store_true", help="disable on-device Face-ID recognition")
     ap.add_argument("--no-vision", action="store_true", help="disable vision-LLM scene understanding")
+    ap.add_argument("--core", default=os.environ.get("AURA_CORE", "http://127.0.0.1:8765"),
+                    help="Aura Core base URL. When the camera runs on System B, point it at System A's "
+                         "LAN IP, e.g. http://192.168.1.23:8765 (or set the AURA_CORE env var).")
     args = ap.parse_args()
     args.face_id = not args.no_face_id
     args.vision = not args.no_vision
+
+    global BASE
+    BASE = args.core.rstrip("/")
+    print(f"[camera] Aura Core -> {BASE}")
 
     try:
         import cv2

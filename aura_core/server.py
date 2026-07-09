@@ -499,7 +499,8 @@ async def emergency_test(request: Request) -> Dict[str, Any]:
     idx = body.get("index") if isinstance(body, dict) else None
     if not isinstance(idx, int):
         return {"ok": False, "error": "need a contact index"}
-    result = await asyncio.get_running_loop().run_in_executor(None, lambda: ecall.send_test(idx))
+    location = (body.get("location") if isinstance(body, dict) else None) or ecall.load_config().get("defaultLocation") or {}
+    result = await asyncio.get_running_loop().run_in_executor(None, lambda: ecall.send_test(idx, location))
     return {"ok": bool(result.get("ok")), "result": result}
 
 
@@ -665,7 +666,7 @@ async def llm_status() -> Dict[str, Any]:
     st["kbChunks"] = len(copilot.chunks)
     st["chatModel"] = st.get("model")
     st["visionAvailable"] = await loop.run_in_executor(None, vision.available)
-    st["visionModel"] = vision.VISION_MODEL
+    st["visionModel"] = vision.active_model()
     return st
 
 
@@ -701,7 +702,8 @@ async def set_config(request: Request) -> Dict[str, Any]:
                 existing = json.load(f)
     except Exception:
         existing = {}
-    for k in ("provider", "openrouter_api_key", "openrouter_model", "nim_api_key", "nim_model"):
+    for k in ("provider", "openrouter_api_key", "openrouter_model", "nim_api_key", "nim_model",
+              "gemini_api_key", "gemini_model"):
         if body.get(k) is not None:
             existing[k] = body[k]
     try:

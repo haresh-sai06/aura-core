@@ -1,13 +1,14 @@
 """Vision-Language scene understanding — the literal "Vision" in Vision→Language→Action.
 
 MediaPipe stays Aura's fast, deterministic SAFETY sensor (the numbers that trigger a takeover).
-This module adds a *semantic* layer on top: a local vision-language model (llava via Ollama)
-looks at an actual camera frame and describes it in words — "driver rubbing their eyes, one hand
-off the wheel, phone visible" or, for a road frame, "pedestrian near the crossing, wet road".
+This module adds a *semantic* layer on top: a multimodal model looks at an actual camera frame and
+describes it — "driver rubbing their eyes, one hand off the wheel, phone visible" or, for a road
+frame, "pedestrian near the crossing, wet road".
 
-It is deliberately OUT of the safety loop: it runs occasionally, enriches the explanation, and
-never gates a life-safety decision (a slow, hallucination-prone LLM must never do that). Fully
-on-device; if llava isn't installed it reports unavailable and the rest of Aura is unaffected.
+Brain routing (mirrors [llm.py]): **Gemini multimodal** (fast, sharp) is primary when a Gemini key
+is set; **local llava via Ollama** is the on-device fallback if the cloud is unavailable. Either
+way it is deliberately OUT of the safety loop — it enriches the explanation and never gates a
+life-safety decision.
 """
 from __future__ import annotations
 
@@ -19,10 +20,13 @@ import urllib.request
 import zlib
 from typing import Any, Dict, Optional
 
+from . import llm
+
 log = logging.getLogger("aura-core")
 
 OLLAMA_URL = "http://127.0.0.1:11434"
-VISION_MODEL = "llava"
+LLAVA_MODEL = "llava"
+VISION_MODEL = "llava"   # kept for back-compat; prefer active_model()
 _TIMEOUT = 90
 
 _CABIN_PROMPT = (
@@ -38,8 +42,7 @@ _ROAD_PROMPT = (
 )
 
 
-def available() -> bool:
-    """Is the llava vision model present in the local Ollama? Lets the UI show an honest badge."""
+def _llava_present() -> bool:
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as r:
             tags = json.loads(r.read().decode("utf-8"))
@@ -48,25 +51,55 @@ def available() -> bool:
         return False
 
 
+def available() -> bool:
+    """Can we describe a frame at all? True if a Gemini key is set OR local llava is present."""
+    return bool(llm._gemini_key()) or _llava_present()
+
+
+def active_model() -> str:
+    """Which vision brain is in effect (for an honest status badge)."""
+    return llm._gemini_model() if llm._gemini_key() else LLAVA_MODEL
+
+
 def _strip_data_url(b64: str) -> str:
-    """Accept either a raw base64 string or a full data: URL and return raw base64."""
-    if b64.startswith("data:"):
-        return b64.split(",", 1)[-1]
-    return b64
+    """Return raw base64 whether given a raw string or a full data: URL."""
+    return b64.split(",", 1)[-1] if b64.startswith("data:") else b64
 
 
-def describe(image_b64: str, kind: str = "cabin", context: Optional[str] = None) -> Dict[str, Any]:
-    """Describe one frame with llava. Returns {ok, description, model}. Best-effort — on any
-    failure returns ok=False with a short reason so the caller degrades gracefully."""
-    if not image_b64:
-        return {"ok": False, "description": "", "error": "no image"}
-    img = _strip_data_url(image_b64)
-    prompt = _ROAD_PROMPT if kind == "road" else _CABIN_PROMPT
-    if context:
-        prompt += f"\nContext: {context}"
+# ── Gemini multimodal (primary) ──────────────────────────────────────
+def _describe_gemini(data_url: str, prompt: str) -> Optional[str]:
+    key = llm._gemini_key()
+    if not key:
+        return None
     body = {
-        "model": VISION_MODEL,
-        "messages": [{"role": "user", "content": prompt, "images": [img]}],
+        "model": llm._gemini_model(),
+        "max_tokens": 150,
+        "temperature": 0.2,
+        "reasoning_effort": "none",   # gemini-2.5-flash thinks by default; keep the reply intact
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]}],
+    }
+    try:
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            llm.GEMINI_URL, data=data,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+        )
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+        return (out["choices"][0]["message"]["content"] or "").strip()
+    except Exception as e:
+        log.warning("vision (gemini) failed (%s) — falling back to local llava", e)
+        return None
+
+
+# ── llava on Ollama (on-device fallback) ─────────────────────────────
+def _describe_llava(img_raw: str, prompt: str) -> Optional[str]:
+    body = {
+        "model": LLAVA_MODEL,
+        "messages": [{"role": "user", "content": prompt, "images": [img_raw]}],
         "stream": False,
         "keep_alive": "30m",
         "options": {"temperature": 0.2, "num_predict": 120},
@@ -78,17 +111,39 @@ def describe(image_b64: str, kind: str = "cabin", context: Optional[str] = None)
         )
         with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
             out = json.loads(resp.read().decode("utf-8"))
-        text = (out.get("message", {}) or {}).get("content", "").strip()
-        return {"ok": bool(text), "description": text or "(no description)", "model": VISION_MODEL, "kind": kind}
+        return (out.get("message", {}) or {}).get("content", "").strip()
     except Exception as e:
-        log.warning("vision.describe failed (%s) — is llava pulled? `ollama pull llava`", e)
-        return {"ok": False, "description": "", "error": str(e), "kind": kind}
+        log.warning("vision (llava) failed (%s) — is llava pulled? `ollama pull llava`", e)
+        return None
+
+
+def describe(image_b64: str, kind: str = "cabin", context: Optional[str] = None) -> Dict[str, Any]:
+    """Describe one frame. Tries Gemini multimodal first, then local llava. Returns
+    {ok, description, model, kind, via}; degrades gracefully on failure."""
+    if not image_b64:
+        return {"ok": False, "description": "", "error": "no image"}
+    raw = _strip_data_url(image_b64)
+    data_url = image_b64 if image_b64.startswith("data:") else f"data:image/jpeg;base64,{raw}"
+    prompt = _ROAD_PROMPT if kind == "road" else _CABIN_PROMPT
+    if context:
+        prompt += f"\nContext: {context}"
+
+    # 1) Gemini multimodal (primary).
+    if llm._gemini_key():
+        text = _describe_gemini(data_url, prompt)
+        if text:
+            return {"ok": True, "description": text, "model": llm._gemini_model(), "kind": kind, "via": "gemini"}
+
+    # 2) On-device llava (fallback).
+    text = _describe_llava(raw, prompt)
+    if text:
+        return {"ok": True, "description": text, "model": LLAVA_MODEL, "kind": kind, "via": "llava"}
+    return {"ok": False, "description": "", "error": "no vision brain available", "kind": kind}
 
 
 def _tiny_png(size: int = 32, gray: int = 120) -> str:
-    """Build a small VALID RGB PNG with only the stdlib (llava 400s on a 1x1), base64-encoded.
-    Used to pre-load the vision model into memory so the first real call isn't the slow one."""
-    row = b"\x00" + bytes([gray, gray, gray]) * size          # filter byte + RGB pixels
+    """A small VALID RGB PNG built with only the stdlib — used to warm/validate the vision path."""
+    row = b"\x00" + bytes([gray, gray, gray]) * size
     raw = row * size
     def chunk(typ: bytes, data: bytes) -> bytes:
         return (struct.pack(">I", len(data)) + typ + data
@@ -101,5 +156,5 @@ def _tiny_png(size: int = 32, gray: int = 120) -> str:
 
 
 def warm() -> bool:
-    """Pre-load llava into memory with a valid tiny image. Returns True if it responded."""
-    return describe(_tiny_png(), kind="cabin").get("ok", False)
+    """Validate/pre-load the active vision path (Gemini has no cold-start; llava gets resident)."""
+    return describe(f"data:image/png;base64,{_tiny_png()}", kind="cabin").get("ok", False)

@@ -43,6 +43,15 @@ DEFAULT_OR_MODEL = "meta-llama/llama-3.3-70b-instruct"
 NIM_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 DEFAULT_NIM_MODEL = "meta/llama-3.3-70b-instruct"
 
+# Gemini — Google's multimodal flash models via the OpenAI-compatible endpoint. Fast + personable;
+# the same key powers the real-time Gemini Live voice (see aoede.py). This is the "personalized
+# feel" brain for now; on-device Ollama remains the edge fallback + the future direction.
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+
+# Providers that speak the OpenAI Chat Completions format (routed through _cloud_endpoint).
+_CLOUD = ("openrouter", "nim", "gemini")
+
 _TIMEOUT = 60
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "aura_config.json")
 _config_cache: Optional[Dict[str, Any]] = None
@@ -94,17 +103,29 @@ def _nim_model() -> str:
     return _config().get("nim_model") or DEFAULT_NIM_MODEL
 
 
+def _gemini_key() -> str:
+    return (_config().get("gemini_api_key") or "").strip()
+
+
+def _gemini_model() -> str:
+    return _config().get("gemini_model") or DEFAULT_GEMINI_MODEL
+
+
 def active_provider() -> str:
     """Which chat provider is in effect. An explicit `provider` in config wins (if its key is
     present); otherwise pick the first cloud provider with a key; else local Ollama."""
     forced = (_config().get("provider") or "").strip().lower()
     if forced == "ollama":
         return "ollama"
+    if forced == "gemini" and _gemini_key():
+        return "gemini"
     if forced == "nim" and _nim_key():
         return "nim"
     if forced == "openrouter" and _or_key():
         return "openrouter"
-    # auto: prefer whichever cloud key exists
+    # auto: prefer Gemini (multimodal, fast, personable), then other cloud keys, else local edge.
+    if _gemini_key():
+        return "gemini"
     if _nim_key():
         return "nim"
     if _or_key():
@@ -116,7 +137,18 @@ def _cloud_endpoint(provider: str):
     """Return (url, headers, model) for an OpenAI-compatible cloud provider."""
     if provider == "nim":
         return NIM_URL, {"Authorization": f"Bearer {_nim_key()}"}, _nim_model()
+    if provider == "gemini":
+        return GEMINI_URL, {"Authorization": f"Bearer {_gemini_key()}"}, _gemini_model()
     return OPENROUTER_URL, _or_headers(), _or_model()
+
+
+def _cloud_extra(provider: str) -> Dict[str, Any]:
+    """Extra request-body params per provider. Gemini 2.5 flash is a THINKING model — its internal
+    reasoning would consume the max_tokens budget and truncate the visible reply, so we turn
+    thinking off for these short, conversational turns."""
+    if provider == "gemini":
+        return {"reasoning_effort": "none"}
+    return {}
 
 
 # ── HTTP helpers ─────────────────────────────────────────────────────
@@ -146,13 +178,15 @@ def ollama_up() -> bool:
 
 def available() -> bool:
     """Is *some* chat brain reachable? (a cloud key present, or local Ollama up)."""
-    return bool(_or_key() or _nim_key()) or ollama_up()
+    return bool(_or_key() or _nim_key() or _gemini_key()) or ollama_up()
 
 
 def _active_model(prov: Optional[str] = None) -> str:
     prov = prov or active_provider()
     if prov == "nim":
         return _nim_model()
+    if prov == "gemini":
+        return _gemini_model()
     if prov == "openrouter":
         return _or_model()
     return CHAT_MODEL
@@ -163,7 +197,7 @@ def status() -> Dict[str, Any]:
     return {
         "provider": prov,
         "model": _active_model(prov),
-        "cloudKey": bool(_or_key() or _nim_key()),
+        "cloudKey": bool(_or_key() or _nim_key() or _gemini_key()),
         "ollama": ollama_up(),
         "embedModel": EMBED_MODEL,
     }
@@ -179,7 +213,7 @@ def chat(
 ) -> str:
     """One-shot chat via the active provider, auto-falling back to Ollama on any cloud error."""
     prov = active_provider()
-    if prov in ("openrouter", "nim"):
+    if prov in _CLOUD:
         url, headers, cloud_model = _cloud_endpoint(prov)
         try:
             out = _post(
@@ -189,6 +223,7 @@ def chat(
                     "messages": messages,
                     "temperature": temperature,
                     "max_tokens": num_predict,
+                    **_cloud_extra(prov),
                 },
                 headers,
             )
@@ -224,10 +259,10 @@ def chat_stream(
     """Stream tokens from the active provider (cloud SSE or Ollama JSON lines).
     Falls back to a one-shot Ollama call if a cloud stream can't be opened."""
     prov = active_provider()
-    if prov in ("openrouter", "nim"):
+    if prov in _CLOUD:
         url, headers, cloud_model = _cloud_endpoint(prov)
         try:
-            yield from _stream_cloud(url, headers, messages, model or cloud_model, temperature, num_predict)
+            yield from _stream_cloud(url, headers, messages, model or cloud_model, temperature, num_predict, _cloud_extra(prov))
             return
         except Exception as e:
             log.warning("%s stream failed (%s) — falling back to Ollama", prov, e)
@@ -238,11 +273,11 @@ def chat_stream(
         return
 
 
-def _stream_cloud(url, headers, messages, model, temperature, num_predict) -> Iterator[str]:
-    """Stream from any OpenAI-compatible endpoint (OpenRouter / NIM) via SSE."""
+def _stream_cloud(url, headers, messages, model, temperature, num_predict, extra=None) -> Iterator[str]:
+    """Stream from any OpenAI-compatible endpoint (OpenRouter / NIM / Gemini) via SSE."""
     body = {
         "model": model, "messages": messages, "temperature": temperature,
-        "max_tokens": num_predict, "stream": True,
+        "max_tokens": num_predict, "stream": True, **(extra or {}),
     }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data,

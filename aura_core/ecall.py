@@ -156,9 +156,10 @@ def _xml_escape(s: str) -> str:
 
 
 # ── dispatch ─────────────────────────────────────────────────────────
-def send_test(index: int) -> Dict[str, Any]:
+def send_test(index: int, location: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Send a friendly TEST message to one contact so the user can validate their credentials
-    before relying on it in a real emergency. Same channel path, harmless content."""
+    before relying on it in a real emergency. Same channel path, harmless content — now with
+    the current GPS coordinates + a map link so the *location* half is validated too."""
     cfg = load_config()
     contacts = cfg.get("contacts", []) or []
     tw = cfg.get("twilio", {}) or {}
@@ -170,7 +171,14 @@ def send_test(index: int) -> Dict[str, Any]:
     text = ("✅ Aura test alert — your emergency-contact setup is working. "
             "This is only a test; no action needed.")
     voice = ("This is a test call from Aura. Your emergency contact setup is working correctly. "
-             "No action is needed. Goodbye.")
+             "No action is needed.")
+    loc = location or {}
+    lat, lng = loc.get("lat"), loc.get("lng")
+    if lat is not None and lng is not None:
+        text += (f"\n📍 Current location: {lat:.5f}, {lng:.5f}"
+                 f"\nMap: https://maps.google.com/?q={lat},{lng}")
+        voice += f" For reference, the current location is latitude {lat:.4f}, longitude {lng:.4f}."
+    voice += " Goodbye."
     if ch == "whatsapp":
         res = _send_whatsapp(phone, c.get("callmebot_key") or "", text)
     elif ch == "sms":
