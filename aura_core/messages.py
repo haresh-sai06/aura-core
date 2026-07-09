@@ -17,8 +17,11 @@ class MessageType(str, Enum):
     DRIVER_STATE = "driver.state"             # continuous live signal: ear, closure, score
     SAFETY_ALERT = "safety.alert"             # adaptive drowsiness/distraction warning
     EXPLAIN = "explain"                        # "why did Aura warn you?" detail
+    REASONING = "reasoning"                    # streamed natural-language "why" from the LLM
+    COPILOT_RESPONSE = "copilot.response"      # grounded RAG answer to a driver question
     # Clients -> Core
     VEHICLE_TELEMETRY = "vehicle.telemetry"   # Unity -> speed/position/scenario
+    COPILOT_QUERY = "copilot.query"           # driver asks the in-car assistant a question
 
 
 def envelope(msg_type: "MessageType | str", payload: Dict[str, Any]) -> Dict[str, Any]:

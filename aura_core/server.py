@@ -15,6 +15,7 @@ What's new over the first slice:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, Dict, Optional, Set
@@ -22,6 +23,8 @@ from typing import Any, Dict, Optional, Set
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from . import llm, reasoning
+from .copilot import Copilot
 from .messages import MessageType, envelope
 from .persona import PersonaStore
 from .policy import AdaptiveSafetyPolicy
@@ -42,6 +45,10 @@ app.add_middleware(
 clients: Set[WebSocket] = set()
 personas = PersonaStore()
 policy = AdaptiveSafetyPolicy(personas)
+copilot = Copilot()
+
+# Last live driver-state seen (fed to the Reasoning Agent + Copilot for "right now" grounding).
+latest_state: Dict[str, Any] = {}
 
 # Which driver is "in the seat". Set by the dashboard selector or (later) face recognition.
 current_driver = "haresh"
@@ -71,6 +78,41 @@ async def broadcast(message: Dict[str, Any], quiet: bool = False, exclude: Optio
         log.info("broadcast %s -> %d client(s)", message.get("type"), len(clients))
 
 
+async def stream_reasoning(driver_id: str, state: Dict[str, Any], acted: bool = True) -> None:
+    """Run the on-device Reasoning Agent and stream its natural-language 'why' onto the bus.
+
+    Emits `reasoning` envelopes with phase start -> delta* -> done so the dashboard's World
+    Model panel can 'type out' the explanation live. The blocking urllib generator is stepped
+    via run_in_executor so the event loop (and every other client) stays responsive.
+    """
+    p = personas.get(driver_id)
+    gen = reasoning.reason_stream(p, state, latest_telemetry or None, acted=acted)
+    loop = asyncio.get_running_loop()
+
+    def _next() -> Optional[str]:
+        try:
+            return next(gen)
+        except StopIteration:
+            return None
+
+    await broadcast(envelope(MessageType.REASONING, {
+        "phase": "start", "driver": p.display_name, "acted": acted, "text": "",
+    }))
+    full = ""
+    while True:
+        piece = await loop.run_in_executor(None, _next)
+        if piece is None:
+            break
+        full += piece
+        await broadcast(envelope(MessageType.REASONING, {
+            "phase": "delta", "driver": p.display_name, "delta": piece, "text": full,
+        }), quiet=True)
+    await broadcast(envelope(MessageType.REASONING, {
+        "phase": "done", "driver": p.display_name, "acted": acted, "text": full.strip(),
+    }))
+    log.info("reasoning streamed (%d chars) for %s", len(full), driver_id)
+
+
 @app.websocket("/")
 async def ws_endpoint(ws: WebSocket) -> None:
     await ws.accept()
@@ -97,6 +139,27 @@ async def ws_endpoint(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         clients.discard(ws)
         log.info("client disconnected (%d total)", len(clients))
+
+
+@app.on_event("startup")
+async def _warmup() -> None:
+    """Pre-warm the on-device stack so the first on-stage request isn't the slow one.
+    Loads qwen2.5:7b into memory and embeds the KB — off the event loop, non-blocking."""
+    async def _run() -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            if await loop.run_in_executor(None, llm.available):
+                await loop.run_in_executor(
+                    None, lambda: llm.chat([{"role": "user", "content": "ok"}], num_predict=1)
+                )
+                await loop.run_in_executor(None, copilot.ensure_embedded)
+                log.info("warmup: on-device LLM + copilot KB ready")
+            else:
+                log.info("warmup: Ollama not reachable — running in offline-fallback mode")
+        except Exception as e:
+            log.warning("warmup skipped (%s)", e)
+
+    asyncio.create_task(_run())
 
 
 @app.on_event("shutdown")
@@ -180,7 +243,122 @@ async def emit_drowsy(eye_closure_s: float = 3.2, score: Optional[float] = None)
     _alerted = True
     await broadcast(decision)
     await broadcast(policy.explain(current_driver, score=score, eye_closure_s=eye_closure_s))
+    # Fire the natural-language Reasoning Agent AFTER the alert (never delay the safety signal
+    # on the LLM). It streams onto the bus as `reasoning`. Scheduled, so this returns instantly.
+    rstate = dict(latest_state)
+    if score is not None:
+        rstate["score"] = score              # fresh fused score IS the trigger
+    else:
+        rstate.pop("score", None)            # drop stale live score — trigger was eye-closure
+        rstate["eyeClosureS"] = eye_closure_s
+    asyncio.create_task(stream_reasoning(current_driver, rstate, acted=True))
     return {"sent": decision}
+
+
+@app.post("/emit/reason")
+async def emit_reason(request: Request) -> Dict[str, Any]:
+    """Manually trigger the Reasoning Agent for the current driver + latest live state.
+    Handy as a demo control ('explain what you're seeing now') independent of an alert."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    acted = bool(body.get("acted", False)) if isinstance(body, dict) else False
+    state = dict(latest_state)
+    if isinstance(body, dict) and isinstance(body.get("state"), dict):
+        state.update(body["state"])
+    asyncio.create_task(stream_reasoning(current_driver, state, acted=acted))
+    return {"ok": True, "driver": current_driver, "acted": acted}
+
+
+@app.post("/copilot/ask")
+async def copilot_ask(request: Request) -> Dict[str, Any]:
+    """Agentic RAG endpoint: answer a driver question grounded in the on-device knowledge base,
+    enriched with the live driver/vehicle state. Also broadcasts the answer as `copilot.response`
+    so every screen (and a future voice UI) can react."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    query = (body.get("query") or body.get("q") or "").strip() if isinstance(body, dict) else ""
+    if not query:
+        return {"ok": False, "error": "empty query"}
+
+    p = personas.get(current_driver)
+    ctx: Dict[str, Any] = {
+        "driver": p.display_name,
+        "threshold": round(p.drowsiness_threshold, 0),
+        "score": latest_state.get("score"),
+        "level": latest_state.get("level"),
+        "speedKmh": (latest_telemetry or {}).get("speedKmh"),
+        "scenario": (latest_telemetry or {}).get("scenario"),
+    }
+    if isinstance(body, dict) and isinstance(body.get("context"), dict):
+        ctx.update(body["context"])
+
+    # Retrieval + generation are blocking (urllib) — run off the event loop.
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: copilot.answer(query, ctx)
+    )
+    payload = {"query": query, "driver": p.display_name, **result}
+    await broadcast(envelope(MessageType.COPILOT_RESPONSE, payload))
+    return {"ok": True, **payload}
+
+
+@app.get("/llm/status")
+async def llm_status() -> Dict[str, Any]:
+    """Report the active LLM brain (cloud/on-device) + model so the UI can badge it honestly."""
+    st = await asyncio.get_running_loop().run_in_executor(None, llm.status)
+    st["kbChunks"] = len(copilot.chunks)
+    st["chatModel"] = st.get("model")
+    return st
+
+
+@app.get("/config")
+async def get_config() -> Dict[str, Any]:
+    """Current LLM config (key redacted) — for a settings panel."""
+    st = llm.status()
+    return {
+        "provider": st["provider"],
+        "model": st["model"],
+        "hasCloudKey": st["cloudKey"],
+        "ollama": st["ollama"],
+    }
+
+
+@app.post("/config")
+async def set_config(request: Request) -> Dict[str, Any]:
+    """Set the LLM provider/key/model at runtime. Writes aura_config.json (gitignored) and
+    hot-reloads so a freshly-pasted OpenRouter key takes effect without a restart."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "expected JSON object"}
+
+    import os as _os
+    cfg_path = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "aura_config.json")
+    existing: Dict[str, Any] = {}
+    try:
+        if _os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+    except Exception:
+        existing = {}
+    for k in ("provider", "openrouter_api_key", "openrouter_model", "nim_api_key", "nim_model"):
+        if body.get(k) is not None:
+            existing[k] = body[k]
+    try:
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2)
+    except Exception as e:
+        return {"ok": False, "error": f"could not write config: {e}"}
+
+    llm.reload_config()
+    # Re-warm the newly-selected brain in the background.
+    asyncio.create_task(_warmup())
+    return {"ok": True, **(await get_config())}
 
 
 @app.post("/emit/resume")
@@ -220,6 +398,10 @@ async def emit_state(request: Request) -> Dict[str, Any]:
             "score": round(score, 1), "baseline": p.eye_closure_threshold_s,
             "threshold": p.drowsiness_threshold, "driver": p.display_name,
         }
+
+    # Remember the latest live signal so the Reasoning Agent + Copilot can ground on "now".
+    global latest_state
+    latest_state = dict(payload)
 
     # Adaptive learning: a clearly-awake sample (well under this driver's line) tunes the baseline.
     try:

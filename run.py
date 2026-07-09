@@ -1,12 +1,14 @@
-"""Entry point: start the Aura Core hub on 127.0.0.1:8765."""
+"""Entry point: start the Aura Core hub on 0.0.0.0:8765 (LAN-reachable)."""
 import uvicorn
 
 if __name__ == "__main__":
-    # ws_ping_interval/timeout disabled: this is a localhost demo and the Unity client
-    # shouldn't be dropped for a missed keepalive pong during long idle stretches.
+    # Bind 0.0.0.0 so the second laptop (Safety Monitor / System B) can reach Core over Wi-Fi.
+    # Head-unit laptop still uses http://127.0.0.1:8765; from System B point the dashboard at
+    # this machine's LAN IP via ?core=<ip> (see aura-dashboard/src/config.ts).
+    # ws_ping_interval/timeout disabled so the Unity client isn't dropped on idle stretches.
     uvicorn.run(
         "aura_core.server:app",
-        host="127.0.0.1",
+        host="0.0.0.0",
         port=8765,
         log_level="info",
         ws_ping_interval=None,
