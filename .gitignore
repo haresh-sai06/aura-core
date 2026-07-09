@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .env
 aura_config.json
+emergency.json
 *.sqlite
 .DS_Store
 
@@ -10,3 +11,7 @@ aura_config.json
 aura_core/personas.json
 # Runtime driver knowledge base (built through conversation at demo time)
 aura_core/driver_knowledge.json
+
+# YOLO weights (auto-downloaded by distraction_monitor)
+*.pt
+bus.jpg

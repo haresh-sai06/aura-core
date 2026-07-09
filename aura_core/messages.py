@@ -23,6 +23,7 @@ class MessageType(str, Enum):
     ORCHESTRATION = "orchestration"            # multi-agent decision cycle (the agent graph trace)
     COUNTERMEASURE = "countermeasure"          # a proactive action the Wellness agent chose
     VISION_SCENE = "vision.scene"              # vision-LLM description of the cabin/road frame
+    ECALL = "ecall"                            # emergency escalation status (armed/dispatched/…)
     # Clients -> Core
     VEHICLE_TELEMETRY = "vehicle.telemetry"   # Unity -> speed/position/scenario
     COPILOT_QUERY = "copilot.query"           # driver asks the in-car assistant a question

@@ -25,7 +25,7 @@ from typing import Any, Dict, Optional, Set
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import llm, reasoning, vision
+from . import ecall, llm, reasoning, vision
 from .agents import Orchestrator
 from .copilot import Copilot
 from .forecast import Forecaster
@@ -33,6 +33,7 @@ from .messages import MessageType, envelope
 from .persona import PersonaStore
 from .policy import AdaptiveSafetyPolicy
 from .conversation import router as conversation_router
+from .aoede import router as aoede_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [aura-core] %(message)s")
 log = logging.getLogger("aura-core")
@@ -49,6 +50,8 @@ app.add_middleware(
 
 # Buddy conversation + per-driver "Driver DNA" knowledge base (First Drive experience).
 app.include_router(conversation_router)
+# Aoede — real-time Gemini Live voice (audio proxied so the API key stays server-side).
+app.include_router(aoede_router)
 
 clients: Set[WebSocket] = set()
 personas = PersonaStore()
@@ -67,6 +70,9 @@ last_reasoning_text: str = ""
 
 # Most recent live face signature observed by the camera process (for dashboard-driven enroll).
 latest_signature: Optional[list] = None
+
+# Most recent vision-LLM scene description (attached to an emergency alert).
+last_vision_text: str = ""
 
 # Trip context (for the Context agent) + throttles so the agent graph doesn't flood the bus.
 _drive_start = time.monotonic()
@@ -384,10 +390,124 @@ async def vision_scene(request: Request) -> Dict[str, Any]:
         None, lambda: vision.describe(image, kind=kind, context=context)
     )
     if result.get("ok"):
+        global last_vision_text
+        last_vision_text = result["description"]
         await broadcast(envelope(MessageType.VISION_SCENE, {
             "description": result["description"], "kind": kind, "driver": personas.get(current_driver).display_name,
         }))
     return result
+
+
+# ── Emergency escalation (eCall) ─────────────────────────────────────
+
+@app.get("/emergency/config")
+async def emergency_config() -> Dict[str, Any]:
+    """Emergency contacts + provider status (secrets redacted) for the dashboard panel."""
+    return ecall.public_config()
+
+
+@app.post("/emergency/config")
+async def set_emergency_config(request: Request) -> Dict[str, Any]:
+    """Save emergency contacts + Twilio credentials (written to gitignored emergency.json)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "expected JSON object"}
+    cfg = ecall.load_config()
+    if isinstance(body.get("contacts"), list):
+        cfg["contacts"] = body["contacts"]
+    if isinstance(body.get("twilio"), dict):
+        cfg["twilio"] = {**cfg.get("twilio", {}), **body["twilio"]}
+    if isinstance(body.get("defaultLocation"), dict):
+        cfg["defaultLocation"] = body["defaultLocation"]
+    ecall.save_config(cfg)
+    return {"ok": True, **ecall.public_config()}
+
+
+@app.post("/emergency/contact/add")
+async def emergency_add_contact(request: Request) -> Dict[str, Any]:
+    """Append one emergency contact (keeps existing contacts' secrets intact, unlike a full
+    config replace where redaction would drop them)."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    c = (body.get("contact") if isinstance(body, dict) else None) or {}
+    if not (c.get("name") and c.get("phone") and c.get("channel")):
+        return {"ok": False, "error": "contact needs name, phone, channel"}
+    cfg = ecall.load_config()
+    cfg.setdefault("contacts", []).append({
+        "name": c["name"], "phone": "".join(ch for ch in str(c["phone"]) if ch.isdigit()),
+        "channel": c["channel"], "callmebot_key": c.get("callmebot_key") or "",
+    })
+    ecall.save_config(cfg)
+    return {"ok": True, **ecall.public_config()}
+
+
+@app.post("/emergency/contact/remove")
+async def emergency_remove_contact(request: Request) -> Dict[str, Any]:
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    idx = body.get("index") if isinstance(body, dict) else None
+    cfg = ecall.load_config()
+    contacts = cfg.get("contacts", [])
+    if isinstance(idx, int) and 0 <= idx < len(contacts):
+        contacts.pop(idx)
+        ecall.save_config(cfg)
+    return {"ok": True, **ecall.public_config()}
+
+
+@app.post("/emergency/dispatch")
+async def emergency_dispatch(request: Request) -> Dict[str, Any]:
+    """Fire the eCall now: build the alert (driver, danger, GPS + map link, cabin scene) and send
+    it to every configured contact. The dashboard owns the 5-second cancel countdown; by the time
+    it calls this, the driver has NOT cancelled."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    p = personas.get(current_driver)
+    location = (body.get("location") if isinstance(body, dict) else None) or ecall.load_config().get("defaultLocation") or {}
+    payload = {
+        "driver": p.display_name,
+        "reason": (body.get("reason") if isinstance(body, dict) else None) or "unresponsive driver (drowsiness takeover)",
+        "location": location,
+        "speedKmh": (latest_telemetry or {}).get("speedKmh"),
+        "score": latest_state.get("score"),
+        "scene": last_vision_text or None,
+    }
+    await broadcast(envelope(MessageType.ECALL, {"phase": "dispatching", "driver": p.display_name, "location": location}))
+    results = await asyncio.get_running_loop().run_in_executor(None, lambda: ecall.dispatch(payload))
+    ok = any(r.get("ok") for r in results)
+    await broadcast(envelope(MessageType.ECALL, {"phase": "dispatched", "driver": p.display_name,
+                                                 "ok": ok, "results": results, "location": location}))
+    log.info("eCall dispatched for %s: %s", p.display_name, "ok" if ok else "all failed")
+    return {"ok": ok, "results": results}
+
+
+@app.post("/emergency/test")
+async def emergency_test(request: Request) -> Dict[str, Any]:
+    """Send a harmless TEST alert to one contact (by index) to validate their credentials."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    idx = body.get("index") if isinstance(body, dict) else None
+    if not isinstance(idx, int):
+        return {"ok": False, "error": "need a contact index"}
+    result = await asyncio.get_running_loop().run_in_executor(None, lambda: ecall.send_test(idx))
+    return {"ok": bool(result.get("ok")), "result": result}
+
+
+@app.post("/emergency/cancel")
+async def emergency_cancel() -> Dict[str, Any]:
+    """Driver cancelled the countdown ('I'm OK') — broadcast so every surface clears the eCall."""
+    await broadcast(envelope(MessageType.ECALL, {"phase": "cancelled", "driver": personas.get(current_driver).display_name}))
+    return {"ok": True}
 
 
 # ── Event injection (camera / test CLI / dashboard) ──────────────────
