@@ -18,16 +18,21 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from datetime import datetime
 from typing import Any, Dict, Optional, Set
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from . import llm, reasoning
+from . import llm, reasoning, vision
+from .agents import Orchestrator
 from .copilot import Copilot
+from .forecast import Forecaster
 from .messages import MessageType, envelope
 from .persona import PersonaStore
 from .policy import AdaptiveSafetyPolicy
+from .conversation import router as conversation_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [aura-core] %(message)s")
 log = logging.getLogger("aura-core")
@@ -42,13 +47,68 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Buddy conversation + per-driver "Driver DNA" knowledge base (First Drive experience).
+app.include_router(conversation_router)
+
 clients: Set[WebSocket] = set()
 personas = PersonaStore()
 policy = AdaptiveSafetyPolicy(personas)
 copilot = Copilot()
+forecaster = Forecaster()
+orchestrator = Orchestrator(personas, forecaster)
 
 # Last live driver-state seen (fed to the Reasoning Agent + Copilot for "right now" grounding).
 latest_state: Dict[str, Any] = {}
+
+# Predictive world-model + multi-agent trace — kept so /state and the MCP server can read them.
+latest_forecast: Dict[str, Any] = {}
+latest_orchestration: Dict[str, Any] = {}
+last_reasoning_text: str = ""
+
+# Most recent live face signature observed by the camera process (for dashboard-driven enroll).
+latest_signature: Optional[list] = None
+
+# Trip context (for the Context agent) + throttles so the agent graph doesn't flood the bus.
+_drive_start = time.monotonic()
+_last_orch_ts = 0.0
+_last_orch_level = -1
+_last_cm_level = -1
+
+
+def _trip_context() -> Dict[str, Any]:
+    """Best-effort trip context for the Context agent: hours driven + time of day + scenario."""
+    hours = max(0.0, (time.monotonic() - _drive_start) / 3600.0)
+    hour = datetime.now().hour
+    tod = ("late night" if hour < 5 else "early morning" if hour < 8 else "daytime"
+           if hour < 17 else "evening" if hour < 21 else "night")
+    return {"hoursDriven": round(hours, 2), "timeOfDay": tod, "scenario": (latest_telemetry or {}).get("scenario")}
+
+
+async def run_orchestration(trigger: str = "state", force: bool = False, copilot_active: bool = False) -> Dict[str, Any]:
+    """Run one multi-agent decision cycle and broadcast the trace + forecast + any countermeasures.
+    Throttled to ~2/s unless the risk level changes (or force=True) so the graph stays live but calm."""
+    global latest_orchestration, _last_orch_ts, _last_orch_level, _last_cm_level
+    payload = orchestrator.run_cycle(
+        current_driver, latest_state, latest_telemetry, _trip_context(),
+        trigger=trigger, copilot_active=copilot_active,
+    )
+    latest_orchestration = payload
+    level = payload["level"]
+    now = time.monotonic()
+    changed = level != _last_orch_level
+    if force or changed or (now - _last_orch_ts) > 0.5:
+        _last_orch_ts = now
+        _last_orch_level = level
+        await broadcast(envelope(MessageType.ORCHESTRATION, payload), quiet=not changed)
+        # Broadcast the Wellness countermeasures once per level change so the HMI can react.
+        if payload["actions"] and level != _last_cm_level and level not in (0, 4):
+            _last_cm_level = level
+            await broadcast(envelope(MessageType.COUNTERMEASURE, {
+                "driver": payload["driver"], "level": level, "actions": payload["actions"],
+            }))
+        if level in (0,):
+            _last_cm_level = -1
+    return payload
 
 # Which driver is "in the seat". Set by the dashboard selector or (later) face recognition.
 current_driver = "haresh"
@@ -107,6 +167,8 @@ async def stream_reasoning(driver_id: str, state: Dict[str, Any], acted: bool = 
         await broadcast(envelope(MessageType.REASONING, {
             "phase": "delta", "driver": p.display_name, "delta": piece, "text": full,
         }), quiet=True)
+    global last_reasoning_text
+    last_reasoning_text = full.strip()
     await broadcast(envelope(MessageType.REASONING, {
         "phase": "done", "driver": p.display_name, "acted": acted, "text": full.strip(),
     }))
@@ -154,6 +216,11 @@ async def _warmup() -> None:
                 )
                 await loop.run_in_executor(None, copilot.ensure_embedded)
                 log.info("warmup: on-device LLM + copilot KB ready")
+                # Pre-load the vision model too (a 1x1 pixel) so the first scene call isn't the
+                # slow one. Guarded — if llava isn't pulled this is a quick no-op.
+                if await loop.run_in_executor(None, vision.available):
+                    ok = await loop.run_in_executor(None, vision.warm)
+                    log.info("warmup: vision model (llava) %s", "resident" if ok else "load failed")
             else:
                 log.info("warmup: Ollama not reachable — running in offline-fallback mode")
         except Exception as e:
@@ -188,11 +255,28 @@ async def drivers() -> Dict[str, Any]:
     return out
 
 
+async def _switch_driver(did: str, source: str = "manual") -> None:
+    """Make `did` the active driver and re-personalize the whole system: persist the outgoing
+    driver's learning, reset trip context + forecaster, and broadcast welcome + explain. Shared by
+    the manual selector and Face-ID recognition."""
+    global current_driver, _alerted, _drive_start, _last_cm_level
+    personas.save()                           # persist any learning for the outgoing driver
+    current_driver = did
+    _alerted = False
+    _drive_start = time.monotonic()           # a new driver = a fresh trip for the Context agent
+    _last_cm_level = -1
+    forecaster.reset(did)                     # don't carry the old driver's trajectory over
+    p = personas.get(did)
+    await broadcast(envelope(MessageType.DRIVER_IDENTIFIED,
+                             {"name": p.display_name, "playlist": p.playlist, "via": source}))
+    await broadcast(policy.explain(did))
+    log.info("driver switched -> %s (%s)", did, source)
+
+
 @app.post("/driver/select")
 async def select_driver(request: Request) -> Dict[str, Any]:
     """Switch the active driver. Accepts ?id=priya or JSON {"id": "priya"}. Broadcasts the
     new persona (welcome + playlist) and an explain so the whole demo re-personalizes at once."""
-    global current_driver, _alerted
     did = request.query_params.get("id")
     if did is None:
         try:
@@ -202,16 +286,108 @@ async def select_driver(request: Request) -> Dict[str, Any]:
             did = None
     if not did or not personas.has(did):
         return {"ok": False, "error": f"unknown driver '{did}'", "drivers": personas.ids()}
-
-    # Persist any learning for the outgoing driver before switching.
-    personas.save()
-    current_driver = did
-    _alerted = False
-    p = personas.get(did)
-    await broadcast(envelope(MessageType.DRIVER_IDENTIFIED, {"name": p.display_name, "playlist": p.playlist}))
-    await broadcast(policy.explain(did))
-    log.info("driver switched -> %s", did)
+    await _switch_driver(did, source="manual")
     return {"ok": True, "driver": personas.to_public(did)}
+
+
+@app.post("/driver/enroll")
+async def enroll_face(request: Request) -> Dict[str, Any]:
+    """Enroll a geometric face signature (from the browser's MediaPipe landmarks) for a driver.
+    Only the numeric signature is stored — never an image. Defaults to the current driver."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        return {"ok": False, "error": "expected JSON object"}
+    did = body.get("id") or current_driver
+    sig = body.get("signature")
+    if not personas.has(did) or not isinstance(sig, list) or not sig:
+        return {"ok": False, "error": "need a valid driver id and non-empty signature"}
+    ok = personas.enroll_face(did, sig)
+    personas.save()
+    return {"ok": ok, "driver": did, "enrolled": personas.enrolled_ids()}
+
+
+@app.post("/driver/recognize")
+async def recognize_face(request: Request) -> Dict[str, Any]:
+    """Given a live face signature, find the closest ENROLLED driver and (if confident and not
+    already active) switch to them — the 'sit down → Welcome, Haresh' moment. On-device."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    sig = body.get("signature") if isinstance(body, dict) else None
+    if not isinstance(sig, list) or not sig:
+        return {"ok": False, "error": "need a signature"}
+    did, dist, conf = personas.recognize_face(sig)
+    if not did:
+        return {"ok": True, "match": None, "distance": dist, "enrolled": personas.enrolled_ids()}
+    switched = did != current_driver
+    if switched:
+        await _switch_driver(did, source="face-id")
+    return {"ok": True, "match": did, "name": personas.get(did).display_name,
+            "distance": dist, "confidence": conf, "switched": switched}
+
+
+@app.get("/faceid/status")
+async def faceid_status() -> Dict[str, Any]:
+    """Which drivers have a face enrolled + whether a live face is in view — for the panel."""
+    return {"enrolled": personas.enrolled_ids(), "current": current_driver,
+            "liveFace": latest_signature is not None}
+
+
+@app.post("/faceid/observe")
+async def faceid_observe(request: Request) -> Dict[str, Any]:
+    """The camera process streams the current live face signature here (numbers only) so the
+    dashboard can enroll the active driver with one click via /driver/enroll_current."""
+    global latest_signature
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    sig = body.get("signature") if isinstance(body, dict) else None
+    latest_signature = sig if isinstance(sig, list) and sig else None
+    return {"ok": True, "hasFace": latest_signature is not None}
+
+
+@app.post("/driver/enroll_current")
+async def enroll_current(request: Request) -> Dict[str, Any]:
+    """Enroll the last-seen live signature for a driver (defaults to the active one). Lets the
+    dashboard's 'Enroll this driver' button work without the browser owning the camera."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    did = (body.get("id") if isinstance(body, dict) else None) or current_driver
+    if latest_signature is None:
+        return {"ok": False, "error": "no live face in view — look at the camera and retry"}
+    ok = personas.enroll_face(did, latest_signature)
+    personas.save()
+    return {"ok": ok, "driver": did, "enrolled": personas.enrolled_ids()}
+
+
+@app.post("/vision/scene")
+async def vision_scene(request: Request) -> Dict[str, Any]:
+    """Vision-LLM scene understanding: describe a camera frame (base64) with llava. Runs OUT of
+    the safety loop. Broadcasts `vision.scene` so any surface can show it."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    image = (body.get("image") or "") if isinstance(body, dict) else ""
+    kind = (body.get("kind") or "cabin") if isinstance(body, dict) else "cabin"
+    context = body.get("context") if isinstance(body, dict) else None
+    if not image:
+        return {"ok": False, "error": "no image"}
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: vision.describe(image, kind=kind, context=context)
+    )
+    if result.get("ok"):
+        await broadcast(envelope(MessageType.VISION_SCENE, {
+            "description": result["description"], "kind": kind, "driver": personas.get(current_driver).display_name,
+        }))
+    return result
 
 
 # ── Event injection (camera / test CLI / dashboard) ──────────────────
@@ -252,6 +428,8 @@ async def emit_drowsy(eye_closure_s: float = 3.2, score: Optional[float] = None)
         rstate.pop("score", None)            # drop stale live score — trigger was eye-closure
         rstate["eyeClosureS"] = eye_closure_s
     asyncio.create_task(stream_reasoning(current_driver, rstate, acted=True))
+    # Force a fresh multi-agent cycle so the agent graph reflects the alert immediately.
+    await run_orchestration(trigger="alert", force=True)
     return {"sent": decision}
 
 
@@ -296,6 +474,8 @@ async def copilot_ask(request: Request) -> Dict[str, Any]:
     if isinstance(body, dict) and isinstance(body.get("context"), dict):
         ctx.update(body["context"])
 
+    # Light up the Copilot node in the agent graph while it thinks.
+    await run_orchestration(trigger="copilot", force=True, copilot_active=True)
     # Retrieval + generation are blocking (urllib) — run off the event loop.
     result = await asyncio.get_running_loop().run_in_executor(
         None, lambda: copilot.answer(query, ctx)
@@ -305,12 +485,67 @@ async def copilot_ask(request: Request) -> Dict[str, Any]:
     return {"ok": True, **payload}
 
 
+@app.get("/state")
+async def get_state() -> Dict[str, Any]:
+    """A rich, read-only snapshot of the edge brain — the live driver state, the predictive
+    world-model forecast, the latest multi-agent decision, and the last explanation. This is the
+    single source the MCP server exposes to external AI clients, and it powers the agent graph on
+    a late-joining dashboard."""
+    p = personas.get(current_driver)
+    return {
+        "driver": {"id": current_driver, "name": p.display_name, "threshold": round(p.drowsiness_threshold, 1),
+                   "genericThreshold": 50.0, "modality": p.preferred_modality, "playlist": p.playlist},
+        "live": latest_state,
+        "forecast": latest_forecast or forecaster.latest(current_driver, p.drowsiness_threshold),
+        "orchestration": latest_orchestration,
+        "lastExplanation": last_reasoning_text,
+        "telemetry": latest_telemetry,
+    }
+
+
+@app.post("/agents/run")
+async def agents_run() -> Dict[str, Any]:
+    """Force one multi-agent cycle now (demo control / MCP)."""
+    payload = await run_orchestration(trigger="manual", force=True)
+    return {"ok": True, "orchestration": payload}
+
+
+@app.post("/agents/countermeasure")
+async def agents_countermeasure(request: Request) -> Dict[str, Any]:
+    """Broadcast a Wellness countermeasure on demand. Lets an external MCP client (e.g. Claude)
+    actually make the car do something — 'cool the cabin', 'play upbeat music', 'find a rest stop'."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    kind = (body.get("kind") or "").strip().lower() if isinstance(body, dict) else ""
+    detail = body.get("detail") if isinstance(body, dict) else None
+    presets = {
+        "climate": {"type": "climate", "detail": detail or "Cool cabin to 19°C"},
+        "music": {"type": "music", "detail": detail or "Switch to an upbeat playlist"},
+        "windows": {"type": "windows", "detail": detail or "Crack windows for airflow"},
+        "navigation": {"type": "navigation", "detail": detail or "Route to the nearest rest stop"},
+        "rest": {"type": "navigation", "detail": detail or "Route to the nearest rest stop"},
+        "break": {"type": "audio", "detail": detail or "Suggest taking a short break"},
+    }
+    action = presets.get(kind)
+    if not action:
+        return {"ok": False, "error": f"unknown countermeasure '{kind}'", "options": list(presets)}
+    await broadcast(envelope(MessageType.COUNTERMEASURE, {
+        "driver": personas.get(current_driver).display_name, "level": None, "actions": [action], "source": "mcp",
+    }))
+    return {"ok": True, "action": action}
+
+
 @app.get("/llm/status")
 async def llm_status() -> Dict[str, Any]:
     """Report the active LLM brain (cloud/on-device) + model so the UI can badge it honestly."""
-    st = await asyncio.get_running_loop().run_in_executor(None, llm.status)
+    loop = asyncio.get_running_loop()
+    st = await loop.run_in_executor(None, llm.status)
     st["kbChunks"] = len(copilot.chunks)
     st["chatModel"] = st.get("model")
+    st["visionAvailable"] = await loop.run_in_executor(None, vision.available)
+    st["visionModel"] = vision.VISION_MODEL
     return st
 
 
@@ -400,7 +635,7 @@ async def emit_state(request: Request) -> Dict[str, Any]:
         }
 
     # Remember the latest live signal so the Reasoning Agent + Copilot can ground on "now".
-    global latest_state
+    global latest_state, latest_forecast
     latest_state = dict(payload)
 
     # Adaptive learning: a clearly-awake sample (well under this driver's line) tunes the baseline.
@@ -413,4 +648,15 @@ async def emit_state(request: Request) -> Dict[str, Any]:
         pass
 
     await broadcast(envelope(MessageType.DRIVER_STATE, payload), quiet=True)
+
+    # Predictive world model: update the forecast from the new score and broadcast it.
+    try:
+        s = float(payload.get("score", 0) or 0)
+        latest_forecast = forecaster.update(current_driver, s, p.drowsiness_threshold)
+        await broadcast(envelope(MessageType.FORECAST, latest_forecast), quiet=True)
+    except Exception as e:
+        log.warning("forecast update failed (%s)", e)
+
+    # Multi-agent decision cycle (throttled inside run_orchestration).
+    await run_orchestration(trigger="state")
     return {"ok": True}

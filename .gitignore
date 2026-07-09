@@ -8,3 +8,5 @@ aura_config.json
 
 # Runtime persona state (learned baselines) — seeded from code, not source
 aura_core/personas.json
+# Runtime driver knowledge base (built through conversation at demo time)
+aura_core/driver_knowledge.json

@@ -19,6 +19,10 @@ class MessageType(str, Enum):
     EXPLAIN = "explain"                        # "why did Aura warn you?" detail
     REASONING = "reasoning"                    # streamed natural-language "why" from the LLM
     COPILOT_RESPONSE = "copilot.response"      # grounded RAG answer to a driver question
+    FORECAST = "forecast"                      # predictive world-model: time-to-microsleep, trend
+    ORCHESTRATION = "orchestration"            # multi-agent decision cycle (the agent graph trace)
+    COUNTERMEASURE = "countermeasure"          # a proactive action the Wellness agent chose
+    VISION_SCENE = "vision.scene"              # vision-LLM description of the cabin/road frame
     # Clients -> Core
     VEHICLE_TELEMETRY = "vehicle.telemetry"   # Unity -> speed/position/scenario
     COPILOT_QUERY = "copilot.query"           # driver asks the in-car assistant a question

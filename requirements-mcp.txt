@@ -1,0 +1,4 @@
+# Optional — only needed to run the Aura MCP server (mcp_server.py), which exposes the edge
+# brain as Model Context Protocol tools for external AI clients (Claude Desktop / Claude Code).
+# The core Aura brain (run.py) has NO extra dependencies beyond requirements.txt.
+mcp[cli]>=1.2.0

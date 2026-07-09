@@ -53,6 +53,9 @@ class Persona:
     # Runtime: EWMA of recent clearly-awake scores that drives adaptive learning.
     calm_ewma: float = field(default=0.0)
     samples: int = 0
+    # On-device Face-ID: a pose-normalized geometric signature from MediaPipe landmarks. Only the
+    # numeric signature is stored — never an image — so recognition stays private and on-device.
+    face_signature: Optional[List[float]] = None
 
     def learn(self, score: float) -> bool:
         """Fold a clearly-awake score into this driver's baseline. Returns True if the
@@ -106,6 +109,7 @@ class PersonaStore:
     _PERSIST = (
         "eye_closure_threshold_s", "drowsiness_threshold", "base_threshold",
         "preferred_modality", "playlist", "accent", "note", "calm_ewma", "samples",
+        "face_signature",
     )
 
     def __init__(self, path: str = _STORE_PATH) -> None:
@@ -135,6 +139,39 @@ class PersonaStore:
         if p is None:
             return False
         return p.learn(score)
+
+    # ── Face-ID (on-device, geometric) ─────────────────────────────────
+    def enroll_face(self, driver_id: str, signature: List[float]) -> bool:
+        """Store a driver's geometric face signature (from MediaPipe landmarks). Only numbers are
+        kept — never an image. Caller persists on a lifecycle event."""
+        p = self._personas.get(driver_id)
+        if p is None or not signature:
+            return False
+        p.face_signature = [float(x) for x in signature]
+        return True
+
+    def recognize_face(self, signature: List[float], threshold: float = 0.55):
+        """Return (driver_id, distance, confidence) of the closest ENROLLED persona, or
+        (None, None, 0.0) if nothing is enrolled or the best match is beyond `threshold`.
+        Distance is Euclidean over the normalized signature; confidence decays with distance."""
+        if not signature:
+            return None, None, 0.0
+        best_id, best_d = None, None
+        for did, p in self._personas.items():
+            sig = p.face_signature
+            if not sig or len(sig) != len(signature):
+                continue
+            d = sum((a - b) ** 2 for a, b in zip(sig, signature)) ** 0.5
+            if best_d is None or d < best_d:
+                best_id, best_d = did, d
+        if best_id is None or best_d is None or best_d > threshold:
+            return None, best_d, 0.0
+        confidence = max(0.0, 1.0 - best_d / threshold)
+        return best_id, round(best_d, 4), round(confidence, 3)
+
+    def enrolled_ids(self) -> List[str]:
+        """Which drivers currently have a face enrolled (for the dashboard Face-ID panel)."""
+        return [did for did, p in self._personas.items() if p.face_signature]
 
     def _load(self) -> None:
         try:
