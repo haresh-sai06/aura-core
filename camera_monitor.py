@@ -149,6 +149,14 @@ def post_json(path: str, obj, timeout: float = 3.0):
         return None
 
 
+def get_json(path: str):
+    try:
+        with urllib.request.urlopen(BASE + path, timeout=2) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Aura webcam drowsiness monitor")
     ap.add_argument("--camera", type=int, default=0, help="webcam index")
@@ -204,6 +212,11 @@ def main() -> None:
     blink_started = [0.0]
     gaze_hist: deque = deque(maxlen=30)
 
+    # Driver identity for the on-screen face box.
+    driver_name = None            # current driver's display name (from Core)
+    recognized = False            # True once Face-ID has matched this face
+    last_health = 0.0
+
     # Face-ID + vision state.
     sig_ewma = None
     last_observe = 0.0
@@ -220,7 +233,7 @@ def main() -> None:
 
     mp_face = mp.solutions.face_mesh
     with mp_face.FaceMesh(
-        max_num_faces=1,
+        max_num_faces=4,
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
@@ -243,7 +256,12 @@ def main() -> None:
                     print("[camera] face detected -> identify")
                     post("/emit/identify")
 
-                lm = result.multi_face_landmarks[0].landmark
+                # Multiple people in frame? The DRIVER is the one closest to the camera =
+                # the largest face (widest cheek-to-cheek span). Everyone else is ignored.
+                faces = result.multi_face_landmarks
+                primary = (max(faces, key=lambda f: abs(f.landmark[454].x - f.landmark[234].x))
+                           if len(faces) > 1 else faces[0])
+                lm = primary.landmark
                 pts = lambda idx: [(lm[i].x * w, lm[i].y * h) for i in idx]  # noqa: E731
                 raw_ear = (eye_aspect_ratio(pts(LEFT_EYE)) + eye_aspect_ratio(pts(RIGHT_EYE))) / 2.0
                 # Exponential smoothing kills single-frame spikes from tracking noise.
@@ -326,8 +344,13 @@ def main() -> None:
                             last_recognize = now
                             resp = post_json("/driver/recognize", {"signature": rounded})
                             try:
-                                if resp and json.loads(resp).get("switched"):
-                                    print("[camera] Face-ID recognized -> switched driver", flush=True)
+                                j = json.loads(resp) if resp else {}
+                                if j.get("match"):
+                                    driver_name = j.get("name") or driver_name
+                                    recognized = True
+                                    print(f"[camera] Face-ID recognized -> {driver_name}", flush=True)
+                                else:
+                                    recognized = False
                             except Exception:
                                 pass
                 # Vision runs on a background thread so llava's seconds don't stall the EAR loop.
@@ -338,6 +361,14 @@ def main() -> None:
                     if ok_enc:
                         b64 = base64.b64encode(buf.tobytes()).decode()
                         threading.Thread(target=read_scene, args=(b64,), daemon=True).start()
+
+                # Keep the current driver name fresh for the on-screen box (even without Face-ID).
+                if now - last_health >= 3.0:
+                    last_health = now
+                    hj = get_json("/health")
+                    if hj:
+                        pdata = hj.get("persona") or {}
+                        driver_name = pdata.get("name") or hj.get("driver") or driver_name
 
                 # Throttled live state for the Live Monitor dashboard — the FULL signal set.
                 if now - last_state >= args.state_interval:
@@ -352,9 +383,19 @@ def main() -> None:
                     }, timeout=2.0)
 
                 if args.show:
-                    color = (0, 0, 255) if closed else (0, 255, 0)
-                    cv2.putText(frame, f"EAR {ear:.2f}", (12, 34),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+                    # Box around the DRIVER's face (the closest person), tagged with their name.
+                    xs = [p.x * w for p in lm]
+                    ys = [p.y * h for p in lm]
+                    pad = int((max(xs) - min(xs)) * 0.16)
+                    x1, y1 = max(0, int(min(xs)) - pad), max(0, int(min(ys)) - pad)
+                    x2, y2 = min(w - 1, int(max(xs)) + pad), min(h - 1, int(max(ys)) + pad)
+                    box_color = (0, 0, 255) if closed else ((80, 200, 80) if recognized else (0, 190, 255))
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 3)
+                    tag = (driver_name or "Unknown") + ("  [Face-ID]" if recognized else "")
+                    cv2.rectangle(frame, (x1, max(0, y1 - 32)), (x1 + 14 + len(tag) * 13, y1), box_color, -1)
+                    cv2.putText(frame, tag, (x1 + 7, y1 - 9), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 0, 0), 2)
+                    cv2.putText(frame, f"EAR {ear:.2f}", (12, 34), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                                (0, 0, 255) if closed else (0, 255, 0), 2)
             else:
                 # Debounce brief tracking dropouts — a 1-frame miss shouldn't re-fire identify.
                 if face_gone_since is None:
