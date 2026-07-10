@@ -293,7 +293,7 @@ async def aoede_ws(ws: WebSocket) -> None:
                     elif t == "end":
                         await session.send_realtime_input(audio_stream_end=True)
 
-            async def gemini_to_browser() -> None:
+            async def _recv_turn() -> None:
                 async for resp in session.receive():
                     data = getattr(resp, "data", None)
                     if data:
@@ -318,6 +318,13 @@ async def aoede_ws(ws: WebSocket) -> None:
                         await ws.send_text(json.dumps({"type": "interrupted"}))
                     if getattr(sc, "turn_complete", False):
                         await ws.send_text(json.dumps({"type": "turn_complete"}))
+
+            async def gemini_to_browser() -> None:
+                # session.receive() is PER-TURN — it ends at each turn_complete. Re-arm it in a
+                # loop so the live session survives across turns (it was closing right after the
+                # greeting). A genuine session close raises here -> handled by the outer except.
+                while True:
+                    await _recv_turn()
 
             b2g = asyncio.create_task(browser_to_gemini())
             g2b = asyncio.create_task(gemini_to_browser())
