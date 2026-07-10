@@ -84,27 +84,20 @@ def mouth_aspect_ratio(lm, w, h) -> float:
 
 
 def head_pose(lm, w, h):
-    """(pitch, yaw, roll) in degrees via solvePnP against a canonical 3D face; (0,0,0) on
-    failure. pitch = nod (up/down), yaw = turn (left/right), roll = head tilt."""
+    """Lightweight geometric head-pose proxy (degrees-ish): pitch = nod (down +), yaw = turn,
+    roll = tilt. Robust and ~0 at rest — avoids solvePnP's calibration quirks for a live demo."""
     try:
-        import cv2
-        import numpy as np
-        model = np.array([
-            (0.0, 0.0, 0.0),        # 1   nose tip
-            (0.0, -63.6, -12.5),    # 152 chin
-            (-43.3, 32.7, -26.0),   # 33  left eye outer corner
-            (43.3, 32.7, -26.0),    # 263 right eye outer corner
-            (-28.9, -28.9, -24.1),  # 61  left mouth corner
-            (28.9, -28.9, -24.1),   # 291 right mouth corner
-        ], dtype=np.float64)
-        image_pts = np.array([_pt(lm, i, w, h) for i in (1, 152, 33, 263, 61, 291)], dtype=np.float64)
-        cam = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], dtype=np.float64)
-        ok, rvec, _ = cv2.solvePnP(model, image_pts, cam, np.zeros((4, 1)))
-        if not ok:
-            return (0.0, 0.0, 0.0)
-        rot, _ = cv2.Rodrigues(rvec)
-        a = cv2.RQDecomp3x3(rot)[0]
-        return (float(a[0]), float(a[1]), float(a[2]))
+        # roll: tilt of the eye line (real angle)
+        roll = math.degrees(math.atan2(lm[263].y - lm[33].y, lm[263].x - lm[33].x))
+        # yaw: nose horizontal offset from the eye-midpoint, normalized by face width
+        eye_cx = (lm[33].x + lm[263].x) / 2.0
+        face_w = abs(lm[454].x - lm[234].x) or 1e-6
+        yaw = (lm[1].x - eye_cx) / face_w * 180.0
+        # pitch: nose vertical position between eye-line and chin (level ~ 0; nodding down +)
+        eye_cy = (lm[33].y + lm[263].y) / 2.0
+        span = (lm[152].y - eye_cy) or 1e-6
+        pitch = ((lm[1].y - eye_cy) / span - 0.30) * 160.0
+        return (float(pitch), float(yaw), float(roll))
     except Exception:
         return (0.0, 0.0, 0.0)
 
