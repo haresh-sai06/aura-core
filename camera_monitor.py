@@ -22,9 +22,11 @@ import base64
 import json
 import math
 import os
+import statistics
 import threading
 import time
 import urllib.request
+from collections import deque
 
 BASE = "http://127.0.0.1:8765"
 
@@ -66,6 +68,70 @@ def eye_aspect_ratio(pts) -> float:
     if horizontal == 0:
         return 0.0
     return (_dist(p2, p6) + _dist(p3, p5)) / (2.0 * horizontal)
+
+
+def _pt(lm, i, w, h):
+    return (lm[i].x * w, lm[i].y * h)
+
+
+def mouth_aspect_ratio(lm, w, h) -> float:
+    """MAR — vertical mouth opening / mouth width. Rises sharply during a yawn."""
+    horiz = _dist(_pt(lm, 61, w, h), _pt(lm, 291, w, h))
+    if horiz == 0:
+        return 0.0
+    vert = (_dist(_pt(lm, 13, w, h), _pt(lm, 14, w, h)) + _dist(_pt(lm, 0, w, h), _pt(lm, 17, w, h))) / 2.0
+    return vert / horiz
+
+
+def head_pose(lm, w, h):
+    """(pitch, yaw, roll) in degrees via solvePnP against a canonical 3D face; (0,0,0) on
+    failure. pitch = nod (up/down), yaw = turn (left/right), roll = head tilt."""
+    try:
+        import cv2
+        import numpy as np
+        model = np.array([
+            (0.0, 0.0, 0.0),        # 1   nose tip
+            (0.0, -63.6, -12.5),    # 152 chin
+            (-43.3, 32.7, -26.0),   # 33  left eye outer corner
+            (43.3, 32.7, -26.0),    # 263 right eye outer corner
+            (-28.9, -28.9, -24.1),  # 61  left mouth corner
+            (28.9, -28.9, -24.1),   # 291 right mouth corner
+        ], dtype=np.float64)
+        image_pts = np.array([_pt(lm, i, w, h) for i in (1, 152, 33, 263, 61, 291)], dtype=np.float64)
+        cam = np.array([[w, 0, w / 2], [0, w, h / 2], [0, 0, 1]], dtype=np.float64)
+        ok, rvec, _ = cv2.solvePnP(model, image_pts, cam, np.zeros((4, 1)))
+        if not ok:
+            return (0.0, 0.0, 0.0)
+        rot, _ = cv2.Rodrigues(rvec)
+        a = cv2.RQDecomp3x3(rot)[0]
+        return (float(a[0]), float(a[1]), float(a[2]))
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+
+def gaze_offsets(lm):
+    """Mean horizontal + vertical iris offset from each eye's centre (~ -1..1). 0 = centred.
+    Needs refine_landmarks (iris landmarks 468 / 473)."""
+    try:
+        def one(iris, outer, inner, top, bot):
+            cx = (lm[outer].x + lm[inner].x) / 2.0
+            cy = (lm[top].y + lm[bot].y) / 2.0
+            wx = abs(lm[inner].x - lm[outer].x) or 1e-6
+            wy = abs(lm[bot].y - lm[top].y) or 1e-6
+            return (lm[iris].x - cx) / wx * 2.0, (lm[iris].y - cy) / wy * 2.0
+        lx, ly = one(468, 33, 133, 159, 145)
+        rx, ry = one(473, 263, 362, 386, 374)
+        return (lx + rx) / 2.0, (ly + ry) / 2.0
+    except Exception:
+        return (0.0, 0.0)
+
+
+def gaze_direction(gx, gy) -> str:
+    if abs(gx) < 0.35 and abs(gy) < 0.55:
+        return "center"
+    if abs(gx) >= abs(gy):
+        return "right" if gx > 0 else "left"
+    return "down" if gy > 0 else "up"
 
 
 def post(path: str):
@@ -138,6 +204,13 @@ def main() -> None:
     alerted = False
     last_debug = 0.0
 
+    # Rolling windows for the full drowsiness fusion (beyond EAR).
+    perclos_win: deque = deque()   # (t, closed) over ~20s -> PERCLOS
+    blink_times: deque = deque()   # (t, dur) blinks over ~60s -> blinks/min
+    blink_open = [True]            # blink state machine (mutable so nested code can flip it)
+    blink_started = [0.0]
+    gaze_hist: deque = deque(maxlen=30)
+
     # Face-ID + vision state.
     sig_ewma = None
     last_observe = 0.0
@@ -184,6 +257,41 @@ def main() -> None:
                 ear = raw_ear if ear_smooth is None else 0.6 * ear_smooth + 0.4 * raw_ear
                 ear_smooth = ear
                 closed = ear < args.ear_threshold
+
+                # --- Full drowsiness fusion (previously EAR only) --------------------
+                mar = mouth_aspect_ratio(lm, w, h)
+                pitch, yaw, roll = head_pose(lm, w, h)
+                gx, gy = gaze_offsets(lm)
+                gaze_hist.append(gx)
+                gaze_std = statistics.pstdev(gaze_hist) if len(gaze_hist) > 3 else 0.0
+                gaze_stability = max(0.0, 1.0 - min(1.0, gaze_std * 5.0))
+                gdir = gaze_direction(gx, gy)
+                # PERCLOS = fraction of the last ~20s the eyes were closed.
+                perclos_win.append((now, closed))
+                while perclos_win and now - perclos_win[0][0] > 20.0:
+                    perclos_win.popleft()
+                perclos = sum(1 for _, c in perclos_win if c) / max(1, len(perclos_win))
+                # Blink rate: count short closures (0.05–0.5s) over the last minute.
+                if closed and blink_open[0]:
+                    blink_open[0] = False
+                    blink_started[0] = now
+                elif (not closed) and not blink_open[0]:
+                    blink_open[0] = True
+                    bd = now - blink_started[0]
+                    if 0.05 < bd < 0.5:
+                        blink_times.append((now, bd))
+                while blink_times and now - blink_times[0][0] > 60.0:
+                    blink_times.popleft()
+                blink_rate = len(blink_times)
+                blink_dur = (sum(d for _, d in blink_times) / len(blink_times)) if blink_times else 0.0
+                closure_now = (now - eyes_closed_since) if eyes_closed_since is not None else 0.0
+                nod = max(0.0, min(1.0, (abs(pitch) - 12.0) / 25.0))
+                # Fused 0–100 drowsiness score: PERCLOS + sustained closure + yawn + head-nod.
+                fused_score = min(100.0,
+                                  perclos * 55.0
+                                  + min(closure_now, 2.5) / 2.5 * 30.0
+                                  + max(0.0, min(1.0, (mar - 0.4) / 0.4)) * 18.0
+                                  + nod * 12.0)
 
                 if args.debug and now - last_debug >= 0.5:
                     last_debug = now
@@ -238,11 +346,17 @@ def main() -> None:
                         b64 = base64.b64encode(buf.tobytes()).decode()
                         threading.Thread(target=read_scene, args=(b64,), daemon=True).start()
 
-                # Throttled live state for the Live Monitor dashboard.
+                # Throttled live state for the Live Monitor dashboard — the FULL signal set.
                 if now - last_state >= args.state_interval:
                     last_state = now
-                    closure = (now - eyes_closed_since) if eyes_closed_since is not None else 0.0
-                    post(f"/emit/state?ear={ear:.3f}&eye_closure_s={closure:.2f}&face_present=true")
+                    post_json("/emit/state", {
+                        "facePresent": True,
+                        "ear": round(ear, 3), "mar": round(mar, 3), "perclos": round(perclos, 3),
+                        "blinkRate": blink_rate, "blinkDuration": round(blink_dur, 3),
+                        "headPitch": round(pitch, 1), "headYaw": round(yaw, 1), "headRoll": round(roll, 1),
+                        "gazeStability": round(gaze_stability, 2), "gazeDirection": gdir,
+                        "eyeClosureS": round(closure_now, 2), "score": round(fused_score, 1),
+                    }, timeout=2.0)
 
                 if args.show:
                     color = (0, 0, 255) if closed else (0, 255, 0)
