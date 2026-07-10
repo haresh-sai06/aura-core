@@ -74,6 +74,10 @@ latest_signature: Optional[list] = None
 # Most recent vision-LLM scene description (attached to an emergency alert).
 last_vision_text: str = ""
 
+# Drive control: the dashboard sets the car's speed; a shared limit drives the over-speed alerts.
+SPEED_LIMIT_KMH = 50.0
+latest_command_speed: float = 0.0
+
 # Trip context (for the Context agent) + throttles so the agent graph doesn't flood the bus.
 _drive_start = time.monotonic()
 _last_orch_ts = 0.0
@@ -509,6 +513,43 @@ async def emergency_cancel() -> Dict[str, Any]:
     """Driver cancelled the countdown ('I'm OK') — broadcast so every surface clears the eCall."""
     await broadcast(envelope(MessageType.ECALL, {"phase": "cancelled", "driver": personas.get(current_driver).display_name}))
     return {"ok": True}
+
+
+# ── Drive control (dashboard → car) ──────────────────────────────────
+
+@app.get("/control/speed")
+async def get_control_speed() -> Dict[str, Any]:
+    """Current commanded speed + the shared limit (for a late-joining dashboard/Unity)."""
+    return {"speedKmh": round(latest_command_speed, 1), "limitKmh": SPEED_LIMIT_KMH,
+            "over": latest_command_speed > SPEED_LIMIT_KMH}
+
+
+@app.post("/control/speed")
+async def control_speed(request: Request) -> Dict[str, Any]:
+    """The System-A Drive Control sets the car's speed. Broadcasts `control.speed` (with the shared
+    limit + over flag) so the Unity car changes speed and every surface alerts when over the limit."""
+    global latest_command_speed
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        speed = float(body.get("speedKmh")) if isinstance(body, dict) else None
+    except (TypeError, ValueError):
+        speed = None
+    if speed is None:
+        return {"ok": False, "error": "need speedKmh"}
+    speed = max(0.0, min(200.0, speed))
+    latest_command_speed = speed
+    payload = {
+        "speedKmh": round(speed, 1),
+        "limitKmh": SPEED_LIMIT_KMH,
+        "over": speed > SPEED_LIMIT_KMH,
+        "overByKmh": round(max(0.0, speed - SPEED_LIMIT_KMH), 1),
+        "driver": personas.get(current_driver).display_name,
+    }
+    await broadcast(envelope(MessageType.CONTROL_SPEED, payload))
+    return {"ok": True, **payload}
 
 
 # ── Event injection (camera / test CLI / dashboard) ──────────────────

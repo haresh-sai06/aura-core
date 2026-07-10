@@ -24,6 +24,7 @@ class MessageType(str, Enum):
     COUNTERMEASURE = "countermeasure"          # a proactive action the Wellness agent chose
     VISION_SCENE = "vision.scene"              # vision-LLM description of the cabin/road frame
     ECALL = "ecall"                            # emergency escalation status (armed/dispatched/…)
+    CONTROL_SPEED = "control.speed"            # dashboard sets the car's speed; carries the limit + over flag
     # Clients -> Core
     VEHICLE_TELEMETRY = "vehicle.telemetry"   # Unity -> speed/position/scenario
     COPILOT_QUERY = "copilot.query"           # driver asks the in-car assistant a question
